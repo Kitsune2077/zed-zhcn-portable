@@ -1,7 +1,6 @@
 # Zed 汉化便携版 for Windows
 
-[![Build](https://github.com/OWNER/zed-zhcn-portable/actions/workflows/build.yml/badge.svg)](https://github.com/OWNER/zed-zhcn-portable/actions/workflows/build.yml)
-*(把上面的 `OWNER` 换成你的 GitHub 用户名)*
+[![Build](https://github.com/Kitsune2077/zed-zhcn-portable/actions/workflows/build.yml/badge.svg)](https://github.com/Kitsune2077/zed-zhcn-portable/actions/workflows/build.yml)
 
 用 GitHub Actions 自动编译的 **Windows 便携版 Zed 编辑器**:开箱即简体中文、所有数据都保存在程序目录的 `data` 文件夹内、跟随官方版本自动升级。每次发布同时提供**单文件 exe** 和 **ZIP 包**两种形态。
 
