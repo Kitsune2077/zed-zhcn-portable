@@ -1,0 +1,281 @@
+name: Build Windows portable (zh-CN)
+
+# 跟随 ReachForStar/zed-ZH_CN 的 release 自动构建 Windows 便携版 Zed:
+#   - 单文件 exe(数据自动存放在 exe 同级 data\ 文件夹)
+#   - ZIP 包(zed.exe + 预置中文配置的 data\ 文件夹)
+#
+# 版本跟随链: zed-industries/zed(官方) -> zed-ZH_CN(汉化源码 fork) -> 本仓库。
+# 每次构建都会在本仓库源码基础上打一个便携化补丁(scripts/apply_portable_patch.py),
+# 上游代码漂移导致补丁无法应用时构建会明确失败,提醒维护者更新补丁。
+
+on:
+  schedule:
+    - cron: '30 1,13 * * *' # 每天 UTC 1:30 / 13:30 各检查一次(北京时间 9:30 / 21:30)
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '强制构建(即使上游版本没有变化)'
+        type: boolean
+        default: false
+      source_ref:
+        description: '指定 zed-ZH_CN 的 ref(tag/分支/commit)。留空 = 自动跟随最新 release;指定后本次构建不回写版本记录'
+        type: string
+        default: ''
+
+permissions:
+  contents: write # 创建 Release 和回写 latest_build.txt
+
+# 定时任务可能重叠,排队而不取消(避免白白浪费几小时编译)
+concurrency:
+  group: build-windows-portable
+  cancel-in-progress: false
+
+env:
+  ZED_REPO: 'ReachForStar/zed-ZH_CN'
+  # 缩短 cargo 路径,规避 Windows 260 字符路径限制(zed 依赖树很深)
+  CARGO_HOME: 'C:\c'
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # 静态链接 CRT + 关闭 LTO:单文件 exe 无需 VC 运行库,且大幅缩短编译时间
+  # (与 sonercirit/zed-windows-stable 的已验证配置一致)
+  RUSTFLAGS: '-C opt-level=3 -C codegen-units=16 -C target-feature=+crt-static'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+  SCCACHE_DIR: 'C:\sccache'
+  SCCACHE_CACHE_SIZE: 8G
+
+jobs:
+  build:
+    name: Build Zed zh-CN portable for Windows
+    runs-on: windows-latest
+    timeout-minutes: 350 # 全量编译约 2~3 小时,上限设为 GitHub 托管机的最大值
+    steps:
+      # zed 仓库有约 240 个符号链接且路径很深,必须先开长路径和开发者模式,
+      # 否则 checkout 或编译会失败(来自 zed-ZH_CN 官方 CI 的已验证做法)
+      - name: Configure Windows (long paths, dev mode, symlinks)
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -PropertyType DWORD -Force | Out-Null
+          git config --system core.longpaths true
+          git config --system core.symlinks true
+          New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream ref and decide whether to build
+        id: resolve
+        shell: pwsh
+        run: |
+          $custom = '${{ github.event.inputs.source_ref }}'.Trim()
+          if ($custom) {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "REF=$custom"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value 'TRACKED=false'
+            Add-Content -Path $env:GITHUB_OUTPUT -Value 'BUILD=true'
+            Write-Host "Manual ref override: building $custom (version tracking skipped)"
+          } else {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ env.ZED_REPO }}/releases/latest"
+            $ref = $release.tag_name
+            $last = ''
+            if (Test-Path .\latest_build.txt) { $last = (Get-Content .\latest_build.txt -Raw).Trim() }
+            $force = '${{ github.event.inputs.force_build }}' -eq 'true'
+            $build = ($ref -ne $last) -or $force
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "REF=$ref"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value 'TRACKED=true'
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "BUILD=$build"
+            Write-Host "Upstream latest: $ref / last built: '$last' / force: $force -> build: $build"
+          }
+
+      - name: Nothing to do
+        if: steps.resolve.outputs.BUILD == 'false'
+        shell: pwsh
+        run: Write-Host '上游版本没有变化,跳过本次构建。'
+
+      - name: Checkout zed-ZH_CN source
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ZED_REPO }}
+          ref: ${{ steps.resolve.outputs.REF }}
+          path: zed
+
+      - name: Set up Python
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Apply portable-data-dir patch
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: python scripts/apply_portable_patch.py zed
+
+      # 发布渠道会被 include_str! 编译进二进制,必须在 cargo build 之前写入;
+      # 与 zed-ZH_CN 官方发布保持一致使用 stable
+      - name: Set release channel
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: Set-Content -Path zed\crates\zed\RELEASE_CHANNEL -Value 'stable' -NoNewline
+
+      # 按源码树里的 rust-toolchain.toml 安装工具链(不用 dtolnay/stable,避免版本不匹配)
+      - name: Install Rust toolchain
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        working-directory: zed
+        run: rustup show
+
+      # 缓存 crate 源码和 sccache 编译缓存(不缓存 target 目录,超出 GitHub 10GB 缓存配额);
+      # 换版本后 hash 变化,fallback 到 restore-keys 恢复旧缓存,增量编译
+      - name: Cache cargo registry and sccache
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\c\registry
+            C:\c\git
+            C:\sccache
+          key: zed-win-build-${{ hashFiles('zed/Cargo.lock') }}
+          restore-keys: |
+            zed-win-build-
+
+      - name: Install sccache
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $tag = (Invoke-RestMethod -Uri 'https://api.github.com/repos/mozilla/sccache/releases/latest').tag_name
+          Invoke-WebRequest -Uri "https://github.com/mozilla/sccache/releases/download/$tag/sccache-$tag-x86_64-pc-windows-msvc.tar.gz" -OutFile sccache.tar.gz
+          tar xzf sccache.tar.gz
+          Move-Item -Path "sccache-$tag-x86_64-pc-windows-msvc\sccache.exe" -Destination "$env:USERPROFILE\.cargo\bin\sccache.exe" -Force
+          sccache --version
+
+      - name: Start sccache server
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER=sccache'
+          sccache --start-server
+          sccache --show-stats
+
+      - name: Build Zed
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        working-directory: zed
+        run: cargo build --release -p zed
+
+      # zed 没有 --version 参数(disable_version_flag),
+      # --printenv 是 main() 里的提前返回分支,可无窗口快速退出,适合冒烟
+      - name: Smoke test
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'zed\target\release\zed.exe').Path
+          Write-Host "zed.exe size: $([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB"
+          $p = Start-Process -FilePath $exe -ArgumentList '--printenv' -PassThru
+          if (-not $p.WaitForExit(90000)) {
+            $p.Kill()
+            Write-Error 'zed.exe --printenv 90 秒内没有退出,二进制可能无法正常启动'
+            exit 1
+          }
+          if ($p.ExitCode -ne 0) {
+            Write-Error "zed.exe --printenv 退出码 $($p.ExitCode)"
+            exit 1
+          }
+          Write-Host 'Smoke test passed.'
+
+      - name: Package artifacts
+        if: steps.resolve.outputs.BUILD == 'true'
+        id: package
+        shell: pwsh
+        run: |
+          $ref = '${{ steps.resolve.outputs.REF }}'
+          $ver = $ref.TrimStart('v')
+          $tag = $ref -replace '[^a-zA-Z0-9._-]', '-'
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$ver"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "TAG=$tag"
+
+          # --- 单文件版:一个 exe,首次启动自动在同级创建 data\ ---
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item 'zed\target\release\zed.exe' "dist\Zed-zhCN-$ver-portable-x64.exe"
+
+          # --- ZIP 版:exe + 预置中文配置的 data\,解压即用 ---
+          New-Item -ItemType Directory -Force -Path 'dist\zip\data\config' | Out-Null
+          Copy-Item 'zed\target\release\zed.exe' 'dist\zip\zed.exe'
+          Copy-Item 'seed\settings.json' 'dist\zip\data\config\settings.json'
+          Copy-Item 'seed\USAGE.txt' 'dist\zip\'
+          Compress-Archive -Path 'dist\zip\*' -DestinationPath "dist\Zed-zhCN-$ver-portable-x64.zip" -Force
+          Remove-Item -Recurse -Force 'dist\zip'
+
+          # --- SHA256 校验和 ---
+          Get-ChildItem 'dist' -File | Where-Object { $_.Extension -in '.exe', '.zip' } | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Out-File -FilePath "$($_.FullName).sha256" -Encoding ascii -NoNewline
+          }
+
+          # --- Release 说明 ---
+          @"
+          # Zed 汉化便携版 ``$ref``
+
+          - 汉化源码:[${{ env.ZED_REPO }}](https://github.com/${{ env.ZED_REPO }}) @ ``$ref``
+          - 上游同步:zed-ZH_CN 会定期合并 [zed-industries/zed](https://github.com/zed-industries/zed) 官方源码,本仓库自动跟随其 release
+          - 便携化:所有用户数据(配置/扩展/数据库/日志)保存在 zed.exe 同级的 ``data`` 文件夹,删除 data 即重置,拷贝整个文件夹即迁移;exe 所在目录不可写时自动回退系统默认目录
+          - 界面语言:默认简体中文(``ui_language: zh-CN``)
+          - 自动更新:已禁用,升级请到本仓库 Releases 下载新版本覆盖
+
+          | 文件 | 说明 |
+          | --- | --- |
+          | ``Zed-zhCN-$ver-portable-x64.exe`` | 单文件版,下载后直接运行 |
+          | ``Zed-zhCN-$ver-portable-x64.zip`` | ZIP 版,解压后运行 zed.exe,自带预置中文配置 |
+          | ``*.sha256`` | 校验和 |
+
+          > exe 未签名,首次运行如遇 SmartScreen 提示,选择"更多信息"→"仍要运行"。
+          > 本构建为社区非官方版本,基于 GPL-3.0 协议的 Zed 源码。
+          "@ | Out-File -FilePath 'dist\release-notes.md' -Encoding utf8
+
+          Get-ChildItem 'dist' | Select-Object Name, @{ N = 'SizeMB'; E = { [math]::Round($_.Length / 1MB, 1) } }
+
+      - name: Create GitHub release
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.TAG }}
+          name: Zed 汉化便携版 ${{ steps.resolve.outputs.REF }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.sha256
+          make_latest: true
+
+      # 只在"跟随最新 release"模式下回写;手动指定 ref 的构建不改版本记录
+      - name: Record built version
+        if: steps.resolve.outputs.BUILD == 'true' && steps.resolve.outputs.TRACKED == 'true'
+        shell: pwsh
+        run: |
+          '${{ steps.resolve.outputs.REF }}' | Out-File -FilePath .\latest_build.txt -Encoding ascii -NoNewline
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add latest_build.txt
+          if (git status --porcelain) {
+            git pull --rebase
+            git commit -m 'Built ${{ steps.resolve.outputs.REF }}'
+            git push
+          } else {
+            Write-Host 'latest_build.txt already up to date.'
+          }
+
+      - name: Job summary
+        if: always() && steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          $summary = @"
+          ## 构建结果
+
+          - 上游 ref:``${{ steps.resolve.outputs.REF }}``
+          - 产物:
+          "@
+          Get-ChildItem 'dist' -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $summary += "`n- ``$($_.Name)`` ($([math]::Round($_.Length / 1MB, 1)) MB)"
+          }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary

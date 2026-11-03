@@ -1,0 +1,14 @@
+# 本地调试时可能检出的 zed 源码树和产物
+zed/
+dist/
+*.exe
+*.zip
+*.sha256
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
