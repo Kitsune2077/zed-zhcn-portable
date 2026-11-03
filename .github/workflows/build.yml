@@ -36,11 +36,11 @@ env:
   CARGO_HOME: 'C:\c'
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
-  # 静态链接 CRT + 关闭 LTO:单文件 exe 无需 VC 运行库,且大幅缩短编译时间
-  # (与 sonercirit/zed-windows-stable 的已验证配置一致)
-  RUSTFLAGS: '-C opt-level=3 -C codegen-units=16 -C target-feature=+crt-static'
-  CARGO_PROFILE_RELEASE_LTO: 'off'
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+  # 仅静态链接 CRT:单文件 exe 不依赖 VC 运行库。
+  # 优化级别 / LTO / codegen-units 不在这里覆盖,构建命令通过
+  # --config .cargo/bundle-config.toml 沿用官方发布配置(thin LTO 等),
+  # 体积与官方发布一致;关闭 LTO 的快速编译配置会让 exe 大 10~25%
+  RUSTFLAGS: '-C target-feature=+crt-static'
   SCCACHE_DIR: 'C:\sccache'
   SCCACHE_CACHE_SIZE: 8G
 
@@ -162,7 +162,10 @@ jobs:
         if: steps.resolve.outputs.BUILD == 'true'
         shell: pwsh
         working-directory: zed
-        run: cargo build --release -p zed
+        # --config .cargo/bundle-config.toml = 官方打包同款优化配置
+        # (thin LTO + codegen-units=1 等),编译时间比关 LTO 长约半小时到一小时,
+        # 换取与官方一致的二进制体积
+        run: cargo --config .cargo/bundle-config.toml build --release -p zed
 
       # zed 没有 --version 参数(disable_version_flag),
       # --printenv 是 main() 里的提前返回分支,可无窗口快速退出,适合冒烟
@@ -204,7 +207,10 @@ jobs:
           Copy-Item 'zed\target\release\zed.exe' 'dist\zip\zed.exe'
           Copy-Item 'seed\settings.json' 'dist\zip\data\config\settings.json'
           Copy-Item 'seed\USAGE.txt' 'dist\zip\'
-          Compress-Archive -Path 'dist\zip\*' -DestinationPath "dist\Zed-zhCN-$ver-portable-x64.zip" -Force
+          # 7z 的 deflate(-mx=9)压缩率明显优于 PowerShell 的 Compress-Archive,
+          # 产物仍是标准 .zip;runner 自带 7-Zip
+          7z a -tzip -mx=9 "dist\Zed-zhCN-$ver-portable-x64.zip" ".\dist\zip\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error '7z packaging failed'; exit 1 }
           Remove-Item -Recurse -Force 'dist\zip'
 
           # --- SHA256 校验和 ---

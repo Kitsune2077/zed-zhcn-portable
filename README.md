@@ -51,11 +51,11 @@ Zed 官方源码目前**不支持**用环境变量重定向数据目录(社区�
 
 ### 编译配置
 
-来自两个已验证项目的组合:
-
 - 长路径 + 开发者模式 + 符号链接(zed 仓库有约 240 个符号链接)、`CARGO_HOME=C:\c` 短路径——来自 zed-ZH_CN 官方 CI;
-- `RUSTFLAGS=-C target-feature=+crt-static` 静态链接 CRT(单文件 exe 不依赖 VC 运行库)、关 LTO 换编译速度、sccache 编译缓存——来自 [zed-windows-stable](https://github.com/sonercirit/zed-windows-stable);
-- Rust 工具链按源码树里的 `rust-toolchain.toml` 安装,发布渠道写 `stable`。
+- `RUSTFLAGS=-C target-feature=+crt-static` 静态链接 CRT(单文件 exe 不依赖 VC 运行库)——来自 [zed-windows-stable](https://github.com/sonercirit/zed-windows-stable) 的已验证配置;
+- 优化级别与 LTO 沿用官方发布同款配置:`cargo --config .cargo/bundle-config.toml`(thin LTO + `codegen-units=1` 等)。相比关闭 LTO 的快速编译配置,exe 体积小 10~25%,编译时间约多半个小时;
+- ZIP 用 7-Zip `-mx=9` 制作(压缩率优于 PowerShell 自带的 Compress-Archive,产物仍是标准 .zip);
+- Rust 工具链按源码树里的 `rust-toolchain.toml` 安装,发布渠道写 `stable`,sccache 编译缓存。
 
 ## 跟随官方升级
 
@@ -91,8 +91,8 @@ python scripts\apply_portable_patch.py zed
 Set-Content zed\crates\zed\RELEASE_CHANNEL 'stable' -NoNewline
 cd zed
 rustup show          # 按 rust-toolchain.toml 安装工具链
-$env:RUSTFLAGS = '-C opt-level=3 -C codegen-units=16 -C target-feature=+crt-static'
-cargo build --release -p zed
+$env:RUSTFLAGS = '-C target-feature=+crt-static'
+cargo --config .cargo/bundle-config.toml build --release -p zed
 # 产物:target\release\zed.exe
 ```
 
