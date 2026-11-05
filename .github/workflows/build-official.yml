@@ -1,0 +1,380 @@
+name: Build Windows portable (zh-CN) · official upstream
+
+# 默认发版工作流:跟随 zed-industries/zed 官方发布,在 CI 里打上汉化和便携化补丁后出包。
+#
+# 版本跟随链: zed-industries/zed(官方) -> LI-NA/zed-i18n(官方源码 + AI 翻译,0~1 天跟进)
+#           -> 本仓库(checkout 官方源码 -> apply zh-CN 翻译 -> 便携补丁 -> cargo build)
+#
+# zed-i18n 是独立汉化工具集(非 fork):它的 release tag vX.Y.Z-i18n.N 表示
+# "官方 vX.Y.Z 的翻译已就绪"。apply 时翻译与源码逐行精确匹配,任何漂移都会
+# 硬失败,不会悄悄产出半汉化构建。
+#
+# 手动兜底:若 zed-i18n 停止维护,可改用 build.yml(跟随 zed-ZH_CN fork,手动触发)。
+
+on:
+  schedule:
+    - cron: '30 1,13 * * *' # 每天 UTC 1:30 / 13:30 各检查一次(北京时间 9:30 / 21:30)
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '强制构建(即使官方版本没有变化)'
+        type: boolean
+        default: false
+      i18n_tag:
+        description: '指定 zed-i18n 的 ref(tag/分支/commit),如 v1.27.0-i18n.1。留空 = 跟随最新 release;指定后本次构建不回写版本记录'
+        type: string
+        default: ''
+
+permissions:
+  contents: write # 创建 Release 和回写 latest_build.txt
+
+# 定时任务可能重叠,排队而不取消(避免白白浪费几小时编译)
+concurrency:
+  group: build-windows-portable-official
+  cancel-in-progress: false
+
+env:
+  I18N_REPO: 'LI-NA/zed-i18n'
+  OFFICIAL_REPO: 'zed-industries/zed'
+  # 缩短 cargo 路径,规避 Windows 260 字符路径限制(zed 依赖树很深)
+  CARGO_HOME: 'C:\c'
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # 仅静态链接 CRT:单文件 exe 不依赖 VC 运行库。
+  # 优化级别 / LTO / codegen-units 不在这里覆盖,构建命令通过
+  # --config .cargo/bundle-config.toml 沿用官方发布配置(thin LTO 等),
+  # 体积与官方发布一致
+  RUSTFLAGS: '-C target-feature=+crt-static'
+  SCCACHE_DIR: 'C:\sccache'
+  SCCACHE_CACHE_SIZE: 8G
+
+jobs:
+  build:
+    name: Build Zed zh-CN portable (official) for Windows
+    runs-on: windows-latest
+    timeout-minutes: 350 # 全量编译约 2~3 小时,上限设为 GitHub 托管机的最大值
+    steps:
+      # zed 仓库有约 240 个符号链接且路径很深,必须先开长路径和开发者模式,
+      # 否则 checkout 或编译会失败(zed 官方 CI 的已验证做法)
+      - name: Configure Windows (long paths, dev mode, symlinks)
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -PropertyType DWORD -Force | Out-Null
+          git config --system core.longpaths true
+          git config --system core.symlinks true
+          New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream refs and decide whether to build
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $custom = '${{ github.event.inputs.i18n_tag }}'.Trim()
+          $force = '${{ github.event.inputs.force_build }}' -eq 'true'
+
+          if ($custom) {
+            # 手动指定 zed-i18n ref(测试用),总是构建,不回写版本记录
+            if ($custom -notmatch '^v\d+\.\d+\.\d+(-i18n\.\d+)?$') {
+              Write-Error "i18n_tag 需形如 vX.Y.Z 或 vX.Y.Z-i18n.N,得到: $custom"
+              exit 1
+            }
+            $i18nTag = $custom
+            $official = $i18nTag -replace '-i18n\.\d+$', ''
+            $tracked = 'false'
+            $build = 'true'
+            Write-Host "Manual i18n ref override: building $i18nTag (official $official, version tracking skipped)"
+          } else {
+            # 1) zed-i18n 最新 release -> vX.Y.Z-i18n.N,解析出官方版本 vX.Y.Z
+            $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/${{ env.I18N_REPO }}/releases/latest"
+            $i18nTag = $release.tag_name
+            if ($i18nTag -notmatch '^v(\d+\.\d+\.\d+)-i18n\.\d+$') {
+              Write-Error "zed-i18n release tag 格式异常: $i18nTag"
+              exit 1
+            }
+            $official = 'v' + $Matches[1]
+
+            # 2) 官方仓库必须已有对应的正式 release(过滤 -pre 等未发布状态)
+            try {
+              Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/${{ env.OFFICIAL_REPO }}/releases/tags/$official" | Out-Null
+            } catch {
+              Write-Host "官方 zed $official 尚无 release,跳过本次。"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "BUILD=false"
+              exit 0
+            }
+
+            # 3) 与已构建版本做语义比较:只在新版本时构建,
+            #    防止 zed-i18n 落后于本仓库已发布版本时"降级"覆盖
+            $baseline = ''
+            if (Test-Path .\latest_build.txt) { $baseline = (Get-Content .\latest_build.txt -Raw).Trim() }
+            if (-not $baseline) {
+              try {
+                $latest = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/${{ github.repository }}/releases/latest"
+                $baseline = $latest.tag_name
+              } catch { } # 仓库还没有任何 release
+            }
+            $baselineVer = ($baseline -replace '^[vV]', '') -replace '-.*$', ''
+            $build = 'true'
+            if (-not $force -and $baselineVer) {
+              try {
+                if ([version]$official.TrimStart('v') -le [version]$baselineVer) { $build = 'false' }
+              } catch { Write-Host "baseline '$baseline' 无法解析为版本号,按需构建处理。" }
+            }
+            $tracked = 'true'
+            Write-Host "zed-i18n latest: $i18nTag / official: $official / baseline: '$baseline' / force: $force -> build: $build"
+          }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "I18N_TAG=$i18nTag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "REF=$official"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "TRACKED=$tracked"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "BUILD=$build"
+
+      - name: Nothing to do
+        if: steps.resolve.outputs.BUILD == 'false'
+        shell: pwsh
+        run: Write-Host '官方版本没有变化,跳过本次构建。'
+
+      - name: Checkout zed-i18n toolkit
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.I18N_REPO }}
+          ref: ${{ steps.resolve.outputs.I18N_TAG }}
+          path: i18n
+
+      - name: Read pinned zed version and commit
+        id: pin
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          $cfg = Get-Content i18n\config\project.toml -Raw
+          $zedVersion = [regex]::Match($cfg, 'zed_version\s*=\s*"([^"]+)"').Groups[1].Value
+          $zedCommit = [regex]::Match($cfg, 'zed_commit\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $zedVersion) { Write-Error 'i18n/config/project.toml 缺少 zed_version'; exit 1 }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ZED_VERSION=$zedVersion"
+          if ($zedCommit) { Add-Content -Path $env:GITHUB_OUTPUT -Value "ZED_COMMIT=$zedCommit" }
+          Write-Host "zed-i18n pins zed $zedVersion @ $zedCommit"
+
+      # 检出位置 i18n/.cache/zed/<version> 正是 zed-i18n 工具集期望的
+      # checkout 路径(config 的 cache_dir + zed_version),无需再跑 fetch-zed。
+      # 优先用 config 锁定的 commit,与 zed-i18n 的翻译清单严格一致。
+      - name: Checkout official zed source
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OFFICIAL_REPO }}
+          ref: ${{ steps.pin.outputs.ZED_COMMIT || steps.pin.outputs.ZED_VERSION }}
+          path: i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}
+
+      - name: Set up Python (portable patch)
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Set up uv
+        if: steps.resolve.outputs.BUILD == 'true'
+        # SHA 与 zed-i18n 上游发布工作流使用的版本一致
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: true
+
+      - name: Apply zh-CN translations (zed-i18n)
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        working-directory: i18n
+        run: |
+          uv python install 3.12
+          uv run zed-i18n apply --language zh-CN
+
+      - name: Apply portable-data-dir patch
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: python scripts/apply_portable_patch.py "i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}" --seed-settings seed/settings-official.json
+
+      # 发布渠道会被 include_str! 编译进二进制,必须在 cargo build 之前写入;
+      # 与官方 stable 发布保持一致
+      - name: Set release channel
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: Set-Content -Path "i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}\crates\zed\RELEASE_CHANNEL" -Value 'stable' -NoNewline
+
+      # 按源码树里的 rust-toolchain.toml 安装工具链(避免版本不匹配)
+      - name: Install Rust toolchain
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        working-directory: i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}
+        run: rustup show
+
+      # 缓存 crate 源码和 sccache 编译缓存(不缓存 target 目录,超出 GitHub 10GB 缓存配额);
+      # key 按官方版本号区分,换版本后 fallback 到 restore-keys 恢复旧缓存,增量编译。
+      # 最后回退到 zed-win-build-(旧 build.yml 工作流的缓存),首建可以热启动
+      - name: Cache cargo registry and sccache
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\c\registry
+            C:\c\git
+            C:\sccache
+          key: zed-win-official-${{ steps.pin.outputs.ZED_VERSION }}
+          restore-keys: |
+            zed-win-official-
+            zed-win-build-
+
+      - name: Install sccache
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $tag = (Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/mozilla/sccache/releases/latest').tag_name
+          Invoke-WebRequest -Uri "https://github.com/mozilla/sccache/releases/download/$tag/sccache-$tag-x86_64-pc-windows-msvc.tar.gz" -OutFile sccache.tar.gz
+          tar xzf sccache.tar.gz
+          Move-Item -Path "sccache-$tag-x86_64-pc-windows-msvc\sccache.exe" -Destination "$env:USERPROFILE\.cargo\bin\sccache.exe" -Force
+          sccache --version
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Start sccache server
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER=sccache'
+          sccache --start-server
+          sccache --show-stats
+
+      - name: Build Zed
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        working-directory: i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}
+        # --config .cargo/bundle-config.toml = 官方打包同款优化配置
+        # (thin LTO + codegen-units=1 等),编译时间比关 LTO 长约半小时到一小时,
+        # 换取与官方一致的二进制体积
+        run: cargo --config .cargo/bundle-config.toml build --release -p zed
+
+      # zed 没有 --version 参数(disable_version_flag),
+      # --printenv 是 main() 里的提前返回分支,可无窗口快速退出,适合冒烟
+      - name: Smoke test
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}\target\release\zed.exe').Path
+          Write-Host "zed.exe size: $([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB"
+          $p = Start-Process -FilePath $exe -ArgumentList '--printenv' -PassThru
+          if (-not $p.WaitForExit(90000)) {
+            $p.Kill()
+            Write-Error 'zed.exe --printenv 90 秒内没有退出,二进制可能无法正常启动'
+            exit 1
+          }
+          if ($p.ExitCode -ne 0) {
+            Write-Error "zed.exe --printenv 退出码 $($p.ExitCode)"
+            exit 1
+          }
+          Write-Host 'Smoke test passed.'
+
+      - name: Package artifacts
+        if: steps.resolve.outputs.BUILD == 'true'
+        id: package
+        shell: pwsh
+        run: |
+          $ref = '${{ steps.resolve.outputs.REF }}'
+          $i18nTag = '${{ steps.resolve.outputs.I18N_TAG }}'
+          $ver = $ref.TrimStart('v')
+          $tag = $ref -replace '[^a-zA-Z0-9._-]', '-'
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$ver"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "TAG=$tag"
+
+          # --- 单文件版:一个 exe,首次启动自动在同级创建 data\ ---
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item 'i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}\target\release\zed.exe' "dist\Zed-zhCN-$ver-portable-x64.exe"
+
+          # --- ZIP 版:exe + 预置配置的 data\,解压即用 ---
+          New-Item -ItemType Directory -Force -Path 'dist\zip\data\config' | Out-Null
+          Copy-Item 'i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}\target\release\zed.exe' 'dist\zip\zed.exe'
+          Copy-Item 'seed\settings-official.json' 'dist\zip\data\config\settings.json'
+          Copy-Item 'seed\USAGE.txt' 'dist\zip\'
+          # 7z 的 deflate(-mx=9)压缩率明显优于 PowerShell 的 Compress-Archive,
+          # 产物仍是标准 .zip;runner 自带 7-Zip
+          7z a -tzip -mx=9 "dist\Zed-zhCN-$ver-portable-x64.zip" ".\dist\zip\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error '7z packaging failed'; exit 1 }
+          Remove-Item -Recurse -Force 'dist\zip'
+
+          # --- SHA256 校验和 ---
+          Get-ChildItem 'dist' -File | Where-Object { $_.Extension -in '.exe', '.zip' } | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Out-File -FilePath "$($_.FullName).sha256" -Encoding ascii -NoNewline
+          }
+
+          # --- Release 说明 ---
+          @"
+          # Zed 汉化便携版 ``$ref``
+
+          - 官方源码:[zed-industries/zed](https://github.com/zed-industries/zed) @ ``$ref``(纯官方 tag,非 fork)
+          - 汉化:[LI-NA/zed-i18n](https://github.com/LI-NA/zed-i18n) @ ``$i18nTag``(简体中文翻译,构建时写入源码;AI 翻译,可能存在少量误译)
+          - 便携化:所有用户数据(配置/扩展/数据库/日志)保存在 zed.exe 同级的 ``data`` 文件夹,删除 data 即重置,拷贝整个文件夹即迁移;exe 所在目录不可写时自动回退系统默认目录
+          - 界面语言:默认简体中文(翻译直接编译进程序,无需语言设置)
+          - 自动更新:已禁用,升级请到本仓库 Releases 下载新版本覆盖
+
+          | 文件 | 说明 |
+          | --- | --- |
+          | ``Zed-zhCN-$ver-portable-x64.exe`` | 单文件版,下载后直接运行 |
+          | ``Zed-zhCN-$ver-portable-x64.zip`` | ZIP 版,解压后运行 zed.exe,自带预置中文配置 |
+          | ``*.sha256`` | 校验和 |
+
+          > exe 未签名,首次运行如遇 SmartScreen 提示,选择"更多信息"→"仍要运行"。
+          > 本构建为社区非官方版本,基于 GPL-3.0 协议的 Zed 官方源码。
+          "@ | Out-File -FilePath 'dist\release-notes.md' -Encoding utf8
+
+          Get-ChildItem 'dist' | Select-Object Name, @{ N = 'SizeMB'; E = { [math]::Round($_.Length / 1MB, 1) } }
+
+      - name: Create GitHub release
+        if: steps.resolve.outputs.BUILD == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve.outputs.REF }}
+          name: Zed 汉化便携版 ${{ steps.resolve.outputs.REF }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.sha256
+          make_latest: true
+
+      # 只在"跟随最新 release"模式下回写;手动指定 i18n_tag 的构建不改版本记录
+      - name: Record built version
+        if: steps.resolve.outputs.BUILD == 'true' && steps.resolve.outputs.TRACKED == 'true'
+        shell: pwsh
+        run: |
+          '${{ steps.resolve.outputs.REF }}' | Out-File -FilePath .\latest_build.txt -Encoding ascii -NoNewline
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add latest_build.txt
+          if (git status --porcelain) {
+            git pull --rebase
+            git commit -m 'Built ${{ steps.resolve.outputs.REF }} (official upstream)'
+            git push
+          } else {
+            Write-Host 'latest_build.txt already up to date.'
+          }
+
+      - name: Job summary
+        if: always() && steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          $summary = @"
+          ## 构建结果
+
+          - 官方源码:zed-industries/zed @ ``${{ steps.resolve.outputs.REF }}``
+          - 汉化:LI-NA/zed-i18n @ ``${{ steps.resolve.outputs.I18N_TAG }}``
+          - 产物:
+          "@
+          Get-ChildItem 'dist' -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $summary += "`n- ``$($_.Name)`` ($([math]::Round($_.Length / 1MB, 1)) MB)"
+          }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary

@@ -1,31 +1,28 @@
-name: Build Windows portable (zh-CN)
+name: Build Windows portable (zh-CN) · ZH_CN fallback
 
-# 跟随 ReachForStar/zed-ZH_CN 的 release 自动构建 Windows 便携版 Zed:
+# 兜底工作流(仅手动触发):跟随 ReachForStar/zed-ZH_CN(汉化源码 fork)构建
+# Windows 便携版 Zed。默认发版已改走 build-official.yml(官方源码 + zed-i18n
+# 汉化,自动跟随);当 zed-i18n 停止维护或需要 fork 源的特定行为时,在 Actions
+# 页面手动运行本工作流出包。
+#
 #   - 单文件 exe(数据自动存放在 exe 同级 data\ 文件夹)
 #   - ZIP 包(zed.exe + 预置中文配置的 data\ 文件夹)
 #
-# 版本跟随链: zed-industries/zed(官方) -> zed-ZH_CN(汉化源码 fork) -> 本仓库。
-# 每次构建都会在本仓库源码基础上打一个便携化补丁(scripts/apply_portable_patch.py),
-# 上游代码漂移导致补丁无法应用时构建会明确失败,提醒维护者更新补丁。
+# 注意:本工作流发布的 tag 带 -zhcn 后缀(如 v1.27.0-zhcn),避免与
+# build-official.yml 的官方版本 tag(如 v1.27.0)冲突;不再回写 latest_build.txt。
 
 on:
-  schedule:
-    - cron: '30 1,13 * * *' # 每天 UTC 1:30 / 13:30 各检查一次(北京时间 9:30 / 21:30)
   workflow_dispatch:
     inputs:
-      force_build:
-        description: '强制构建(即使上游版本没有变化)'
-        type: boolean
-        default: false
       source_ref:
-        description: '指定 zed-ZH_CN 的 ref(tag/分支/commit)。留空 = 自动跟随最新 release;指定后本次构建不回写版本记录'
+        description: '指定 zed-ZH_CN 的 ref(tag/分支/commit)。留空 = 使用最新 release tag'
         type: string
         default: ''
 
 permissions:
-  contents: write # 创建 Release 和回写 latest_build.txt
+  contents: write # 创建 Release
 
-# 定时任务可能重叠,排队而不取消(避免白白浪费几小时编译)
+# 手动构建可能重叠,排队而不取消(避免白白浪费几小时编译)
 concurrency:
   group: build-windows-portable
   cancel-in-progress: false
@@ -64,33 +61,23 @@ jobs:
       - name: Checkout this repository
         uses: actions/checkout@v4
 
-      - name: Resolve upstream ref and decide whether to build
+      - name: Resolve upstream ref
         id: resolve
         shell: pwsh
         run: |
+          # 兜底工作流手动触发即构建,不做版本比较(latest_build.txt 归
+          # build-official.yml 管理),也不回写版本记录
           $custom = '${{ github.event.inputs.source_ref }}'.Trim()
           if ($custom) {
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "REF=$custom"
-            Add-Content -Path $env:GITHUB_OUTPUT -Value 'TRACKED=false'
-            Add-Content -Path $env:GITHUB_OUTPUT -Value 'BUILD=true'
-            Write-Host "Manual ref override: building $custom (version tracking skipped)"
+            $ref = $custom
+            Write-Host "Manual ref override: building $ref"
           } else {
             $release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ env.ZED_REPO }}/releases/latest"
             $ref = $release.tag_name
-            $last = ''
-            if (Test-Path .\latest_build.txt) { $last = (Get-Content .\latest_build.txt -Raw).Trim() }
-            $force = '${{ github.event.inputs.force_build }}' -eq 'true'
-            $build = ($ref -ne $last) -or $force
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "REF=$ref"
-            Add-Content -Path $env:GITHUB_OUTPUT -Value 'TRACKED=true'
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "BUILD=$build"
-            Write-Host "Upstream latest: $ref / last built: '$last' / force: $force -> build: $build"
+            Write-Host "Upstream latest: $ref"
           }
-
-      - name: Nothing to do
-        if: steps.resolve.outputs.BUILD == 'false'
-        shell: pwsh
-        run: Write-Host '上游版本没有变化,跳过本次构建。'
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "REF=$ref"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value 'BUILD=true'
 
       - name: Checkout zed-ZH_CN source
         if: steps.resolve.outputs.BUILD == 'true'
@@ -194,7 +181,8 @@ jobs:
         run: |
           $ref = '${{ steps.resolve.outputs.REF }}'
           $ver = $ref.TrimStart('v')
-          $tag = $ref -replace '[^a-zA-Z0-9._-]', '-'
+          # 兜底发布的 tag 统一加 -zhcn 后缀,避免与 build-official.yml 的官方版本 tag 冲突
+          $tag = ($ref -replace '[^a-zA-Z0-9._-]', '-') + '-zhcn'
           Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$ver"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "TAG=$tag"
 
@@ -221,10 +209,13 @@ jobs:
 
           # --- Release 说明 ---
           @"
-          # Zed 汉化便携版 ``$ref``
+          # Zed 汉化便携版 ``$ref``（ZH_CN fork 源）
+
+          > 本发布由兜底工作流（Build Windows portable · ZH_CN fallback）手动产出。
+          > 默认发版走官方源码 + zed-i18n 汉化的自动管线,见 tag 不带 -zhcn 后缀的 release。
 
           - 汉化源码:[${{ env.ZED_REPO }}](https://github.com/${{ env.ZED_REPO }}) @ ``$ref``
-          - 上游同步:zed-ZH_CN 会定期合并 [zed-industries/zed](https://github.com/zed-industries/zed) 官方源码,本仓库自动跟随其 release
+          - 上游同步:zed-ZH_CN 会定期合并 [zed-industries/zed](https://github.com/zed-industries/zed) 官方源码
           - 便携化:所有用户数据(配置/扩展/数据库/日志)保存在 zed.exe 同级的 ``data`` 文件夹,删除 data 即重置,拷贝整个文件夹即迁移;exe 所在目录不可写时自动回退系统默认目录
           - 界面语言:默认简体中文(``ui_language: zh-CN``)
           - 自动更新:已禁用,升级请到本仓库 Releases 下载新版本覆盖
@@ -246,30 +237,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.package.outputs.TAG }}
-          name: Zed 汉化便携版 ${{ steps.resolve.outputs.REF }}
+          name: Zed 汉化便携版 ${{ steps.resolve.outputs.REF }}（ZH_CN fork 源）
           body_path: dist/release-notes.md
           files: |
             dist/*.exe
             dist/*.zip
             dist/*.sha256
-          make_latest: true
-
-      # 只在"跟随最新 release"模式下回写;手动指定 ref 的构建不改版本记录
-      - name: Record built version
-        if: steps.resolve.outputs.BUILD == 'true' && steps.resolve.outputs.TRACKED == 'true'
-        shell: pwsh
-        run: |
-          '${{ steps.resolve.outputs.REF }}' | Out-File -FilePath .\latest_build.txt -Encoding ascii -NoNewline
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add latest_build.txt
-          if (git status --porcelain) {
-            git pull --rebase
-            git commit -m 'Built ${{ steps.resolve.outputs.REF }}'
-            git push
-          } else {
-            Write-Host 'latest_build.txt already up to date.'
-          }
+          make_latest: false
 
       - name: Job summary
         if: always() && steps.resolve.outputs.BUILD == 'true'
