@@ -224,6 +224,7 @@ jobs:
           | --- | --- |
           | ``Zed-zhCN-$ver-portable-x64.exe`` | 单文件版,下载后直接运行 |
           | ``Zed-zhCN-$ver-portable-x64.zip`` | ZIP 版,解压后运行 zed.exe,自带预置中文配置 |
+          | ``Zed-zhCN-$ver-setup-x64.exe`` | 安装版,向导安装(默认用户目录,无需管理员权限),数据仍在安装目录的 ``data``,带卸载程序 |
           | ``*.sha256`` | 校验和 |
 
           > exe 未签名,首次运行如遇 SmartScreen 提示,选择"更多信息"→"仍要运行"。
@@ -231,6 +232,17 @@ jobs:
           "@ | Out-File -FilePath 'dist\release-notes.md' -Encoding utf8
 
           Get-ChildItem 'dist' | Select-Object Name, @{ N = 'SizeMB'; E = { [math]::Round($_.Length / 1MB, 1) } }
+
+      # 传统安装包(与默认工作流同一套 Inno Setup 脚本);数据仍在安装目录的 data\
+      - name: Build setup installer (Inno Setup)
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          & .\installer\build-installer.ps1 `
+            -ZedRoot "zed" `
+            -Version "${{ steps.package.outputs.VERSION }}" `
+            -SeedSettings "seed/settings.json" `
+            -DistDir "dist"
 
       - name: Create GitHub release
         if: steps.resolve.outputs.BUILD == 'true'

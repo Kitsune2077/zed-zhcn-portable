@@ -3,10 +3,15 @@ name: Build Windows portable (zh-CN) · official upstream
 # 默认发版工作流:跟随 zed-industries/zed 官方发布,在 CI 里打上汉化和便携化补丁后出包。
 #
 # 版本跟随链: zed-industries/zed(官方) -> LI-NA/zed-i18n(官方源码 + AI 翻译,0~1 天跟进)
-#           -> 本仓库(checkout 官方源码 -> apply zh-CN 翻译 -> 便携补丁 -> cargo build)
+#           -> 本仓库(checkout 官方源码 -> 嵌入 zh-CN 语言包并注入语言设置
+#              -> 便携补丁 -> cargo build)
+#
+# 采用 zed-i18n 的 universal 模式:语言包在运行时加载,设置里的"显示语言"
+# 可在 跟随系统 / English / 简体中文 之间切换。构建时会裁剪
+# config/locales.toml,只打包 en-US 与 zh-CN 两种语言。
 #
 # zed-i18n 是独立汉化工具集(非 fork):它的 release tag vX.Y.Z-i18n.N 表示
-# "官方 vX.Y.Z 的翻译已就绪"。apply 时翻译与源码逐行精确匹配,任何漂移都会
+# "官方 vX.Y.Z 的翻译已就绪"。apply 时翻译与源码逐字节精确匹配,任何漂移都会
 # 硬失败,不会悄悄产出半汉化构建。
 #
 # 手动兜底:若 zed-i18n 停止维护,可改用 build.yml(跟随 zed-ZH_CN fork,手动触发)。
@@ -156,6 +161,13 @@ jobs:
           $zedVersion = [regex]::Match($cfg, 'zed_version\s*=\s*"([^"]+)"').Groups[1].Value
           $zedCommit = [regex]::Match($cfg, 'zed_commit\s*=\s*"([^"]+)"').Groups[1].Value
           if (-not $zedVersion) { Write-Error 'i18n/config/project.toml 缺少 zed_version'; exit 1 }
+          # 防止 zed-i18n 的 tag 与它锁定的官方版本错配(例如打了 v1.28 的 tag
+          # 但 config 还停在 v1.27),否则会拿错误版本的翻译去构建
+          $expected = '${{ steps.resolve.outputs.REF }}'.TrimStart('v')
+          if ($zedVersion.TrimStart('v') -ne $expected) {
+            Write-Error "zed-i18n 锁定 zed $zedVersion,与 tag 解析出的官方版本 ${{ steps.resolve.outputs.REF }} 不一致;拒绝构建"
+            exit 1
+          }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ZED_VERSION=$zedVersion"
           if ($zedCommit) { Add-Content -Path $env:GITHUB_OUTPUT -Value "ZED_COMMIT=$zedCommit" }
           Write-Host "zed-i18n pins zed $zedVersion @ $zedCommit"
@@ -184,13 +196,29 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Apply zh-CN translations (zed-i18n)
+      # 语言包在运行时加载(universal 模式):构建前把 zed-i18n 的
+      # config/locales.toml 裁剪为中文 + 英文,其余语言不打包、也不出现在
+      # 设置的"显示语言"下拉框中;源语言 en-US 始终保留(英文回退)。
+      - name: Restrict bundled locales to zh-CN and English
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        working-directory: i18n
+        run: python ../scripts/limit_i18n_locales.py config/locales.toml --keep en-US,zh-CN
+
+      - name: Generate runtime locale bundles (zed-i18n)
         if: steps.resolve.outputs.BUILD == 'true'
         shell: pwsh
         working-directory: i18n
         run: |
           uv python install 3.12
-          uv run zed-i18n apply --language zh-CN
+          uv run zed-i18n generate-runtime-bundles --zed-root ".cache/zed/${{ steps.pin.outputs.ZED_VERSION }}"
+
+      # 注入 localization crate、ui_locale 设置项和语言下拉框
+      - name: Apply universal localization (zed-i18n)
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        working-directory: i18n
+        run: uv run zed-i18n apply-universal --zed-root ".cache/zed/${{ steps.pin.outputs.ZED_VERSION }}"
 
       - name: Apply portable-data-dir patch
         if: steps.resolve.outputs.BUILD == 'true'
@@ -316,15 +344,16 @@ jobs:
           # Zed 汉化便携版 ``$ref``
 
           - 官方源码:[zed-industries/zed](https://github.com/zed-industries/zed) @ ``$ref``(纯官方 tag,非 fork)
-          - 汉化:[LI-NA/zed-i18n](https://github.com/LI-NA/zed-i18n) @ ``$i18nTag``(简体中文翻译,构建时写入源码;AI 翻译,可能存在少量误译)
+          - 汉化:[LI-NA/zed-i18n](https://github.com/LI-NA/zed-i18n) @ ``$i18nTag``(简体中文运行时语言包;AI 翻译,可能存在少量误译)
           - 便携化:所有用户数据(配置/扩展/数据库/日志)保存在 zed.exe 同级的 ``data`` 文件夹,删除 data 即重置,拷贝整个文件夹即迁移;exe 所在目录不可写时自动回退系统默认目录
-          - 界面语言:默认简体中文(翻译直接编译进程序,无需语言设置)
+          - 界面语言:默认简体中文(``ui_locale: zh-CN``),可在设置中切换为 English 或跟随系统;仅内置中文与英文两种语言包
           - 自动更新:已禁用,升级请到本仓库 Releases 下载新版本覆盖
 
           | 文件 | 说明 |
           | --- | --- |
           | ``Zed-zhCN-$ver-portable-x64.exe`` | 单文件版,下载后直接运行 |
           | ``Zed-zhCN-$ver-portable-x64.zip`` | ZIP 版,解压后运行 zed.exe,自带预置中文配置 |
+          | ``Zed-zhCN-$ver-setup-x64.exe`` | 安装版,向导安装(默认用户目录,无需管理员权限),数据仍在安装目录的 ``data``,带卸载程序 |
           | ``*.sha256`` | 校验和 |
 
           > exe 未签名,首次运行如遇 SmartScreen 提示,选择"更多信息"→"仍要运行"。
@@ -332,6 +361,19 @@ jobs:
           "@ | Out-File -FilePath 'dist\release-notes.md' -Encoding utf8
 
           Get-ChildItem 'dist' | Select-Object Name, @{ N = 'SizeMB'; E = { [math]::Round($_.Length / 1MB, 1) } }
+
+      # 传统安装包:Inno Setup 向导安装(与 Zed 官方 zed.iss 同款技术)。
+      # 默认装到 %LOCALAPPDATA%\Programs\Zed-zhCN(用户目录始终可写),
+      # 数据仍由便携补丁放在安装目录的 data\;卸载时询问是否删除数据。
+      - name: Build setup installer (Inno Setup)
+        if: steps.resolve.outputs.BUILD == 'true'
+        shell: pwsh
+        run: |
+          & .\installer\build-installer.ps1 `
+            -ZedRoot "i18n/.cache/zed/${{ steps.pin.outputs.ZED_VERSION }}" `
+            -Version "${{ steps.package.outputs.VERSION }}" `
+            -SeedSettings "seed/settings-official.json" `
+            -DistDir "dist"
 
       - name: Create GitHub release
         if: steps.resolve.outputs.BUILD == 'true'
